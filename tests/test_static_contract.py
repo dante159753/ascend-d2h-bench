@@ -27,10 +27,23 @@ class StaticContractTest(unittest.TestCase):
             "--allocator",
             "--io-size",
             "--io-count",
+            "--tensor-size-list",
             "--streams",
             "--iters",
         ]:
             self.assertIn(option, readme)
+
+    def test_benchmark_exposes_fragmented_tensor_size_list(self):
+        source = read("src/ascend_d2h_bench.cpp")
+        readme = read("README.md")
+        self.assertIn("--tensor-size-list", source)
+        self.assertIn("131072,16384,32768", readme)
+
+    def test_bandwidth_unit_is_bytes_not_bits(self):
+        source = read("src/ascend_d2h_bench.cpp")
+        readme = read("README.md")
+        self.assertIn("bandwidth_avg_GBps", source)
+        self.assertIn("GB/s", readme)
 
 
 if __name__ == "__main__":

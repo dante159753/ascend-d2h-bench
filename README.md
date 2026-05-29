@@ -33,6 +33,7 @@ The CMake probe enables optional modes when the CANN headers support them:
   --allocator all \
   --io-size 128k \
   --io-count 64 \
+  --tensor-size-list 131072,16384,32768 \
   --streams 4 \
   --warmup 5 \
   --iters 50
@@ -50,6 +51,7 @@ Core parameters:
   - `register-pinned`: same mmap/mlock allocation, then `aclrtHostRegisterV2(... ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED ...)`.
 - `--io-size`: bytes per D2H slice. Suffixes `k`, `m`, and `g` are accepted.
 - `--io-count`: number of D2H slices per measured iteration.
+- `--tensor-size-list`: optional comma-separated D2H slice pattern. When set, the benchmark repeats this list until `--io-count` slices are generated, so `--tensor-size-list 131072,16384,32768 --io-count 64` simulates a more fragmented tensor layout than fixed-size slices.
 - `--streams`: stream count for `async-loop`.
 - `--batch-size`: max slice count per `aclrtMemcpyBatch` call.
 - `--warmup`: unmeasured warmup iterations.
@@ -69,6 +71,12 @@ Compare async loop and batch copy for 128 KB slices:
 
 ```bash
 ./build/ascend_d2h_bench --mode all --allocator ucm-direct --io-size 128k --io-count 64 --streams 4
+```
+
+Simulate a fragmented tensor size list:
+
+```bash
+./build/ascend_d2h_bench --mode all --allocator ucm-direct --tensor-size-list 131072,16384,32768 --io-count 192 --streams 4
 ```
 
 Sweep stream count:
@@ -94,6 +102,6 @@ For each mode/allocator case, the benchmark prints:
 - `total_us`: measured iteration duration.
 - `submit_us`: time spent issuing copy calls.
 - `sync_wait_us`: time spent waiting after submit. For `async-loop`, this is the final stream synchronization wait.
-- `bandwidth_avg_gbps`: decimal GB/s computed from `io-size * io-count / total_avg_time`.
+- `bandwidth_avg_GBps`: decimal GB/s, computed from the actual copied bytes per iteration divided by average total time.
 
 Timing is per iteration, not per copy, so the measurement path does not add high-frequency timing calls inside the copy loop.

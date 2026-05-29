@@ -37,6 +37,7 @@ struct Options {
     size_t warmup = 5;
     size_t iters = 50;
     size_t batchSize = 4096;
+    std::vector<size_t> tensorSizeList;
     std::string mode = "all";
     std::string allocator = "all";
     bool verify = false;
@@ -56,6 +57,11 @@ struct Stats {
     double p90 = 0.0;
     double p99 = 0.0;
     double max = 0.0;
+};
+
+struct CopySlice {
+    size_t offset = 0;
+    size_t size = 0;
 };
 
 [[noreturn]] void Die(const std::string& msg)
@@ -87,13 +93,23 @@ std::string Lower(std::string s)
     return s;
 }
 
+std::string Trim(std::string s)
+{
+    auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+    return s;
+}
+
 size_t ParseSize(std::string value)
 {
     value = Lower(value);
     size_t pos = 0;
     double number = std::stod(value, &pos);
     std::string suffix = value.substr(pos);
-    suffix.erase(std::remove_if(suffix.begin(), suffix.end(), ::isspace), suffix.end());
+    suffix.erase(std::remove_if(suffix.begin(), suffix.end(), [](unsigned char c) {
+        return std::isspace(c);
+    }), suffix.end());
 
     double multiplier = 1.0;
     if (suffix.empty() || suffix == "b") {
@@ -109,6 +125,20 @@ size_t ParseSize(std::string value)
     }
     if (number <= 0) { Die("size must be positive"); }
     return static_cast<size_t>(number * multiplier);
+}
+
+std::vector<size_t> ParseSizeList(const std::string& value)
+{
+    std::vector<size_t> sizes;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = Trim(item);
+        if (item.empty()) { Die("tensor size list contains an empty item"); }
+        sizes.push_back(ParseSize(item));
+    }
+    if (sizes.empty()) { Die("tensor size list must not be empty"); }
+    return sizes;
 }
 
 size_t ParseSizeT(const std::string& value, const std::string& name)
@@ -138,6 +168,7 @@ void PrintHelp(const char* argv0)
         << "  --allocator aclrt-malloc-host|ucm-direct|register-pinned|all\n"
         << "  --io-size BYTES             Supports suffixes k/m/g, default 128k\n"
         << "  --io-count N                Number of D2H slices per iteration, default 64\n"
+        << "  --tensor-size-list LIST     Comma-separated slice sizes repeated to io-count\n"
         << "  --streams N                 Streams for async-loop, default 1\n"
         << "  --batch-size N              Max slices per aclrtMemcpyBatch call, default 4096\n"
         << "  --warmup N                  Warmup iterations, default 5\n"
@@ -169,6 +200,8 @@ Options ParseArgs(int argc, char** argv)
             opt.ioSize = ParseSize(needValue(arg));
         } else if (arg == "--io-count") {
             opt.ioCount = ParseSizeT(needValue(arg), arg);
+        } else if (arg == "--tensor-size-list") {
+            opt.tensorSizeList = ParseSizeList(needValue(arg));
         } else if (arg == "--streams") {
             opt.streams = ParseSizeT(needValue(arg), arg);
         } else if (arg == "--batch-size") {
@@ -425,13 +458,50 @@ const char* AddBytesConst(const void* ptr, size_t offset)
     return static_cast<const char*>(ptr) + offset;
 }
 
-IterTiming RunAsyncLoop(const Options& opt, DeviceBuffer& device, HostBuffer& host, StreamSet& streams)
+std::vector<CopySlice> BuildCopyPlan(const Options& opt)
+{
+    std::vector<CopySlice> plan;
+    plan.reserve(opt.ioCount);
+    size_t offset = 0;
+    for (size_t i = 0; i < opt.ioCount; ++i) {
+        const size_t size = opt.tensorSizeList.empty()
+            ? opt.ioSize
+            : opt.tensorSizeList[i % opt.tensorSizeList.size()];
+        if (std::numeric_limits<size_t>::max() - offset < size) {
+            Die("total byte size overflow");
+        }
+        plan.push_back({offset, size});
+        offset += size;
+    }
+    return plan;
+}
+
+size_t TotalBytes(const std::vector<CopySlice>& plan)
+{
+    if (plan.empty()) { return 0; }
+    const auto& last = plan.back();
+    return last.offset + last.size;
+}
+
+std::string CopyPattern(const Options& opt)
+{
+    if (opt.tensorSizeList.empty()) { return std::to_string(opt.ioSize); }
+    std::ostringstream os;
+    for (size_t i = 0; i < opt.tensorSizeList.size(); ++i) {
+        if (i != 0) { os << ';'; }
+        os << opt.tensorSizeList[i];
+    }
+    return os.str();
+}
+
+IterTiming RunAsyncLoop(const std::vector<CopySlice>& plan, DeviceBuffer& device, HostBuffer& host,
+                        StreamSet& streams)
 {
     auto begin = Clock::now();
-    for (size_t i = 0; i < opt.ioCount; ++i) {
-        const size_t offset = i * opt.ioSize;
-        CheckAcl(aclrtMemcpyAsync(AddBytes(host.Data(), offset), opt.ioSize,
-                                  AddBytes(device.Data(), offset), opt.ioSize,
+    for (size_t i = 0; i < plan.size(); ++i) {
+        const auto& slice = plan[i];
+        CheckAcl(aclrtMemcpyAsync(AddBytes(host.Data(), slice.offset), slice.size,
+                                  AddBytes(device.Data(), slice.offset), slice.size,
                                   ACL_MEMCPY_DEVICE_TO_HOST, streams.At(i)),
                  "aclrtMemcpyAsync(D2H)");
     }
@@ -441,13 +511,12 @@ IterTiming RunAsyncLoop(const Options& opt, DeviceBuffer& device, HostBuffer& ho
     return {ElapsedUs(begin, end), ElapsedUs(begin, submitted), ElapsedUs(submitted, end)};
 }
 
-IterTiming RunSync(const Options& opt, DeviceBuffer& device, HostBuffer& host)
+IterTiming RunSync(const std::vector<CopySlice>& plan, DeviceBuffer& device, HostBuffer& host)
 {
     auto begin = Clock::now();
-    for (size_t i = 0; i < opt.ioCount; ++i) {
-        const size_t offset = i * opt.ioSize;
-        CheckAcl(aclrtMemcpy(AddBytes(host.Data(), offset), opt.ioSize,
-                             AddBytes(device.Data(), offset), opt.ioSize,
+    for (const auto& slice : plan) {
+        CheckAcl(aclrtMemcpy(AddBytes(host.Data(), slice.offset), slice.size,
+                             AddBytes(device.Data(), slice.offset), slice.size,
                              ACL_MEMCPY_DEVICE_TO_HOST),
                  "aclrtMemcpy(D2H)");
     }
@@ -456,15 +525,16 @@ IterTiming RunSync(const Options& opt, DeviceBuffer& device, HostBuffer& host)
     return {total, total, 0.0};
 }
 
-IterTiming RunBatch(const Options& opt, DeviceBuffer& device, HostBuffer& host)
+IterTiming RunBatch(const Options& opt, const std::vector<CopySlice>& plan, DeviceBuffer& device,
+                    HostBuffer& host)
 {
 #if HAVE_ACLRT_MEMCPY_BATCH
     auto begin = Clock::now();
-    for (size_t start = 0; start < opt.ioCount; start += opt.batchSize) {
-        const size_t n = std::min(opt.batchSize, opt.ioCount - start);
+    for (size_t start = 0; start < plan.size(); start += opt.batchSize) {
+        const size_t n = std::min(opt.batchSize, plan.size() - start);
         std::vector<void*> dst(n);
         std::vector<void*> src(n);
-        std::vector<size_t> sizes(n, opt.ioSize);
+        std::vector<size_t> sizes(n);
         std::vector<aclrtMemcpyBatchAttr> attrs(n);
         std::vector<size_t> attrIds(n);
         int32_t deviceId = 0;
@@ -472,9 +542,10 @@ IterTiming RunBatch(const Options& opt, DeviceBuffer& device, HostBuffer& host)
         aclrtMemLocation hostLoc{0, ACL_MEM_LOCATION_TYPE_HOST};
         aclrtMemLocation deviceLoc{static_cast<uint32_t>(deviceId), ACL_MEM_LOCATION_TYPE_DEVICE};
         for (size_t i = 0; i < n; ++i) {
-            const size_t offset = (start + i) * opt.ioSize;
-            dst[i] = AddBytes(host.Data(), offset);
-            src[i] = AddBytes(device.Data(), offset);
+            const auto& slice = plan[start + i];
+            dst[i] = AddBytes(host.Data(), slice.offset);
+            src[i] = AddBytes(device.Data(), slice.offset);
+            sizes[i] = slice.size;
             attrs[i] = aclrtMemcpyBatchAttr{hostLoc, deviceLoc, {}};
             attrIds[i] = i;
         }
@@ -492,6 +563,7 @@ IterTiming RunBatch(const Options& opt, DeviceBuffer& device, HostBuffer& host)
     return {total, total, 0.0};
 #else
     (void)opt;
+    (void)plan;
     (void)device;
     (void)host;
     Die("batch mode requires aclrtMemcpyBatch; rebuild with newer CANN headers");
@@ -533,17 +605,17 @@ void VerifyCopied(const DeviceBuffer&, const HostBuffer& host)
 std::vector<IterTiming> RunCase(const Options& opt, const std::string& mode,
                                 const std::string& allocator)
 {
-    const size_t totalBytes = opt.ioSize * opt.ioCount;
-    if (totalBytes / opt.ioSize != opt.ioCount) { Die("total byte size overflow"); }
+    const auto plan = BuildCopyPlan(opt);
+    const size_t totalBytes = TotalBytes(plan);
 
     DeviceBuffer device(totalBytes);
     HostBuffer host = HostBuffer::Allocate(allocator, totalBytes);
     StreamSet streams(std::max<size_t>(1, opt.streams));
 
     auto runOnce = [&]() {
-        if (mode == "async-loop") { return RunAsyncLoop(opt, device, host, streams); }
-        if (mode == "sync") { return RunSync(opt, device, host); }
-        if (mode == "batch") { return RunBatch(opt, device, host); }
+        if (mode == "async-loop") { return RunAsyncLoop(plan, device, host, streams); }
+        if (mode == "sync") { return RunSync(plan, device, host); }
+        if (mode == "batch") { return RunBatch(opt, plan, device, host); }
         Die("invalid mode: " + mode);
     };
 
@@ -565,6 +637,8 @@ std::vector<IterTiming> RunCase(const Options& opt, const std::string& mode,
 void PrintStats(const Options& opt, const std::string& mode, const std::string& allocator,
                 const std::vector<IterTiming>& timings)
 {
+    const auto plan = BuildCopyPlan(opt);
+    const size_t totalBytes = TotalBytes(plan);
     std::vector<double> total;
     std::vector<double> submit;
     std::vector<double> sync;
@@ -579,27 +653,30 @@ void PrintStats(const Options& opt, const std::string& mode, const std::string& 
     const auto totalStats = Summarize(total);
     const auto submitStats = Summarize(submit);
     const auto syncStats = Summarize(sync);
-    const double bytes = static_cast<double>(opt.ioSize) * static_cast<double>(opt.ioCount);
-    const double gbps = bytes / (totalStats.avg / 1e6) / 1e9;
+    const double bytes = static_cast<double>(totalBytes);
+    const double GBps = bytes / (totalStats.avg / 1e6) / 1e9;
+    const std::string copyPattern = CopyPattern(opt);
 
     if (opt.csv) {
         std::cout << mode << ',' << allocator << ',' << opt.ioSize << ',' << opt.ioCount << ','
-                  << opt.streams << ',' << totalStats.avg << ',' << totalStats.p50 << ','
-                  << totalStats.p90 << ',' << totalStats.p99 << ',' << gbps << ','
+                  << opt.streams << ',' << totalBytes << ',' << copyPattern << ','
+                  << totalStats.avg << ',' << totalStats.p50 << ','
+                  << totalStats.p90 << ',' << totalStats.p99 << ',' << GBps << ','
                   << submitStats.avg << ',' << syncStats.avg << '\n';
         return;
     }
 
     std::cout << "\nmode=" << mode << " allocator=" << allocator
               << " io_size=" << opt.ioSize << " io_count=" << opt.ioCount
-              << " streams=" << opt.streams << '\n';
+              << " streams=" << opt.streams << " total_bytes=" << totalBytes
+              << " copy_pattern=" << copyPattern << '\n';
     std::cout << std::fixed << std::setprecision(3)
               << "  total_us avg=" << totalStats.avg << " min=" << totalStats.min
               << " p50=" << totalStats.p50 << " p90=" << totalStats.p90
               << " p99=" << totalStats.p99 << " max=" << totalStats.max << '\n';
     std::cout << "  submit_us avg=" << submitStats.avg
               << " sync_wait_us avg=" << syncStats.avg << '\n';
-    std::cout << "  bandwidth_avg_gbps=" << gbps << '\n';
+    std::cout << "  bandwidth_avg_GBps=" << GBps << '\n';
 }
 
 }  // namespace
@@ -613,8 +690,9 @@ int main(int argc, char** argv)
             opt.allocator, {"aclrt-malloc-host", "ucm-direct", "register-pinned"}, "allocator");
 
         if (opt.csv) {
-            std::cout << "mode,allocator,io_size,io_count,streams,total_avg_us,total_p50_us,"
-                         "total_p90_us,total_p99_us,bandwidth_avg_gbps,submit_avg_us,"
+            std::cout << "mode,allocator,io_size,io_count,streams,total_bytes,copy_pattern,"
+                         "total_avg_us,total_p50_us,total_p90_us,total_p99_us,"
+                         "bandwidth_avg_GBps,submit_avg_us,"
                          "sync_wait_avg_us\n";
         }
 
